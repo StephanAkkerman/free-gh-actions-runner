@@ -39,7 +39,7 @@ systemctl enable --now docker
 # 2b. Enable QEMU binfmt for transparent x86_64 / amd64 Docker emulation
 docker run --privileged --rm tonistiigi/binfmt --install amd64
 
-# 2c. Configure Docker daemon log rotation & BuildKit GC
+# 2c. Configure Docker daemon log rotation & BuildKit
 cat << 'EOF' > /etc/docker/daemon.json
 {
   "log-driver": "json-file",
@@ -95,7 +95,6 @@ RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/la
 curl -o /tmp/actions-runner.tar.gz -L "https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-arm64-$${RUNNER_VERSION}.tar.gz"
 
 # 5. Exchange Fine-Grained PAT for an Organization Registration Token
-# (A single registration token can be used to register multiple runners within its 1-hour validity window)
 REG_TOKEN=$(curl -s -X POST \
   -H "Accept: application/vnd.github+json" \
   -H "Authorization: Bearer ${github_pat}" \
@@ -110,7 +109,7 @@ fi
 # 6. Create a shared pre-job cleanup hook so root-owned Docker artifacts don't break subsequent checkouts
 cat << 'EOF' > /home/runner/cleanup-hook.sh
 #!/bin/bash
-if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "$GITHUB_WORKSPACE" ]; then
+if [ -n "$${GITHUB_WORKSPACE:-}" ] && [ -d "$GITHUB_WORKSPACE" ]; then
   sudo chown -R runner:runner "$GITHUB_WORKSPACE" 2>/dev/null || true
 fi
 EOF
@@ -149,7 +148,7 @@ for i in $(seq -f "%02g" 1 ${runner_count}); do
     --unattended \
     --replace"
 
-  # Install & start distinct systemd service (e.g., actions.runner.<org>.oci-ampere-runner-01.service)
+  # Install & start distinct systemd service
   (cd "$RUNNER_DIR" && ./svc.sh install runner && ./svc.sh start)
 done
 
