@@ -1,0 +1,165 @@
+#!/bin/bash
+set -euo pipefail
+
+exec > >(tee /var/log/github-runner-setup.log|logger -t github-runner-setup -s 2>/dev/console) 2>&1
+echo "Starting GitHub Actions Runner provisioning..."
+
+export DEBIAN_FRONTEND=noninteractive
+
+# 1. System updates & essential CI dependencies
+apt-get update -y
+apt-get upgrade -y
+apt-get install -y \
+  ca-certificates \
+  curl \
+  gnupg \
+  jq \
+  git \
+  unzip \
+  zip \
+  tar \
+  build-essential \
+  apt-transport-https \
+  software-properties-common
+
+# 2. Install official Docker Engine + Buildx + Compose plugin
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+
+# 2b. Enable QEMU binfmt for transparent x86_64 / amd64 Docker emulation
+docker run --privileged --rm tonistiigi/binfmt --install amd64
+
+# 2c. Configure Docker daemon log rotation & BuildKit GC
+cat << 'EOF' > /etc/docker/daemon.json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "3"
+  },
+  "features": {
+    "buildkit": true
+  }
+}
+EOF
+systemctl restart docker
+
+# 2d. Add 4GB Swap file to prevent OOM kills during heavy parallel builds
+if [ ! -f /swapfile ]; then
+  fallocate -l 4G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  sysctl vm.swappiness=10
+  echo 'vm.swappiness=10' >> /etc/sysctl.d/99-ci-tuning.conf
+fi
+
+# 2e. Kernel & ulimit tuning for CI/CD workloads (file watchers & descriptors)
+cat << 'EOF' >> /etc/sysctl.d/99-ci-tuning.conf
+fs.inotify.max_user_watches=524288
+fs.inotify.max_user_instances=512
+fs.file-max=2097152
+EOF
+sysctl --system
+
+cat << 'EOF' >> /etc/security/limits.d/99-runner.conf
+runner soft nofile 1048576
+runner hard nofile 1048576
+runner soft nproc unlimited
+runner hard nproc unlimited
+EOF
+
+# Cap systemd journal logs to 500MB
+sed -i 's/#SystemMaxUse=/SystemMaxUse=500M/' /etc/systemd/journald.conf
+systemctl restart systemd-journald
+
+# 3. Create dedicated runner user and grant Docker permissions
+if ! id -u runner >/dev/null 2>&1; then
+  useradd -m -s /bin/bash runner
+fi
+usermod -aG docker runner
+
+# 4. Download latest GitHub Actions Runner tarball once
+RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+curl -o /tmp/actions-runner.tar.gz -L "https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-arm64-$${RUNNER_VERSION}.tar.gz"
+
+# 5. Exchange Fine-Grained PAT for an Organization Registration Token
+# (A single registration token can be used to register multiple runners within its 1-hour validity window)
+REG_TOKEN=$(curl -s -X POST \
+  -H "Accept: application/vnd.github+json" \
+  -H "Authorization: Bearer ${github_pat}" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "https://api.github.com/orgs/${github_org}/actions/runners/registration-token" | jq -r '.token')
+
+if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = "null" ]; then
+  echo "ERROR: Failed to obtain registration token from GitHub API. Check github_pat and github_org."
+  exit 1
+fi
+
+# 6. Create a shared pre-job cleanup hook so root-owned Docker artifacts don't break subsequent checkouts
+cat << 'EOF' > /home/runner/cleanup-hook.sh
+#!/bin/bash
+if [ -n "${GITHUB_WORKSPACE:-}" ] && [ -d "$GITHUB_WORKSPACE" ]; then
+  sudo chown -R runner:runner "$GITHUB_WORKSPACE" 2>/dev/null || true
+fi
+EOF
+chmod +x /home/runner/cleanup-hook.sh
+chown runner:runner /home/runner/cleanup-hook.sh
+
+echo "runner ALL=(ALL) NOPASSWD: /usr/bin/chown" > /etc/sudoers.d/runner-cleanup
+chmod 440 /etc/sudoers.d/runner-cleanup
+
+# 7. Loop through and register each runner instance
+for i in $(seq -f "%02g" 1 ${runner_count}); do
+  INSTANCE_NAME="${runner_name_prefix}-$${i}"
+  RUNNER_DIR="/home/runner/actions-runner-$${i}"
+
+  echo "Setting up $${INSTANCE_NAME} in $${RUNNER_DIR}..."
+  mkdir -p "$RUNNER_DIR"
+  tar xzf /tmp/actions-runner.tar.gz -C "$RUNNER_DIR"
+  chown -R runner:runner "$RUNNER_DIR"
+
+  # Install OS dependencies on the first iteration only
+  if [ "$i" = "01" ]; then
+    "$RUNNER_DIR/bin/installdependencies.sh"
+  fi
+
+  # Attach the workspace cleanup hook to this runner's environment
+  echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/home/runner/cleanup-hook.sh" >> "$RUNNER_DIR/.env"
+  chown runner:runner "$RUNNER_DIR/.env"
+
+  # Register with GitHub
+  su - runner -c "cd $RUNNER_DIR && ./config.sh \
+    --url https://github.com/${github_org} \
+    --token $${REG_TOKEN} \
+    --name $${INSTANCE_NAME} \
+    --labels ${runner_labels} \
+    --work _work \
+    --unattended \
+    --replace"
+
+  # Install & start distinct systemd service (e.g., actions.runner.<org>.oci-ampere-runner-01.service)
+  (cd "$RUNNER_DIR" && ./svc.sh install runner && ./svc.sh start)
+done
+
+rm -f /tmp/actions-runner.tar.gz
+
+# 8. Set up weekly cron job to prune old Docker caches & unused images (>7 days old)
+cat << 'EOF' > /etc/cron.weekly/docker-prune
+#!/bin/bash
+docker system prune -af --filter "until=168h"
+EOF
+chmod +x /etc/cron.weekly/docker-prune
+
+echo "GitHub Actions Runner setup completed!"
